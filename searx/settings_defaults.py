@@ -199,6 +199,10 @@ SCHEMA: dict[str, t.Any] = {
         'default_lang': SettingsValue(tuple(SXNG_LOCALE_TAGS + ['']), ''),
         'languages': SettingSublistValue(SXNG_LOCALE_TAGS, SXNG_LOCALE_TAGS),  # type: ignore
         'ban_time_on_fail': SettingsValue(numbers.Real, 5),
+        # shaded: answer at this many seconds once ``deadline_min_answered`` engines
+        # have answered, instead of waiting for the slowest engine (None: upstream)
+        'deadline': SettingsValue((None, numbers.Real), None),
+        'deadline_min_answered': SettingsValue(int, 1),
         'max_ban_time_on_fail': SettingsValue(numbers.Real, 120),
         # shaded: exponential suspension with a cap, and one probe after expiry
         'suspend_backoff': {
@@ -277,6 +281,8 @@ SCHEMA: dict[str, t.Any] = {
         # shaded: false, true / "query" (one Tor circuit per search, one ShadeNet
         # tunnel per engine) or "engine" (one Tor circuit per search and engine)
         'isolate': SettingsValue((bool, str), False),
+        # shaded: retry an engine on a fresh Tor circuit after a 429 / 403 / CAPTCHA
+        'fresh_circuit_retries': SettingsValue(int, 0),
         # shaded: ShadeNet proxy budget (see searx.search.shadenet)
         'shadenet': {
             'url': SettingsValue((None, str), None),

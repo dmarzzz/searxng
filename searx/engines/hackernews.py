@@ -27,6 +27,16 @@ results_per_page = 30
 # Search URL
 base_url = "https://hn.algolia.com/api/v1"
 
+# shaded: query HN's Algolia index directly instead of the hn.algolia.com API,
+# which answers 403 to Tor exits.  The application id and the *search-only* key
+# are the public ones the hn.algolia.com web page sends from every browser.
+algolia_app_id = ""
+"""Algolia application id (``UJ5WYC0L7X`` for HN); empty: use ``base_url``."""
+algolia_search_key = ""
+"""Algolia search-only API key published by the hn.algolia.com page."""
+algolia_index = "Item_dev"
+algolia_index_by_date = "Item_dev_sort_date"
+
 
 def request(query, params):
     search_type = 'search'
@@ -37,6 +47,8 @@ def request(query, params):
             "tags": "front_page",
             "page": (params["pageno"] - 1),
         }
+        if algolia_app_id:
+            query_params = {"tagFilters": '["front_page"]', "page": (params["pageno"] - 1)}
     else:
         query_params = {
             "query": query,
@@ -63,6 +75,13 @@ def request(query, params):
                 - relativedelta(**{f"{params['time_range']}s": 1})  # type: ignore
             ).timestamp()
             query_params["numericFilters"] = f"created_at_i>{timestamp}"
+
+    if algolia_app_id:
+        index = algolia_index_by_date if search_type == 'search_by_date' else algolia_index
+        params["url"] = f"https://{algolia_app_id.lower()}-dsn.algolia.net/1/indexes/{index}?{urlencode(query_params)}"
+        params["headers"]["X-Algolia-Application-Id"] = algolia_app_id
+        params["headers"]["X-Algolia-API-Key"] = algolia_search_key
+        return params
 
     params["url"] = f"{base_url}/{search_type}?{urlencode(query_params)}"
     return params

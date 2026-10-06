@@ -262,7 +262,8 @@ class ResultContainer:
         """shaded: record what happened to one engine in this search.
 
         ``status`` is one of ``sent``, ``ok``, ``empty``, ``error``, ``timeout``,
-        ``suspended``, ``unsupported``, ``capped`` (over the ShadeNet
+        ``late`` (still running at ``search.deadline``), ``suspended``,
+        ``unsupported``, ``capped`` (over the ShadeNet
         engines-per-query cap) or ``budget`` (the ShadeNet proxy could not open the
         tunnels in time).  Unlike :py:obj:`add_unresponsive_engine` this ignores
         ``display_error_messages``: the caller always learns what was skipped.

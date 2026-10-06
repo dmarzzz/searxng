@@ -7,10 +7,13 @@ import typing as t
 
 from timeit import default_timer
 import asyncio
+import copy
 import ssl
 from curl_cffi.requests.exceptions import RequestException, Timeout, ConnectionError as CurlConnectionError, ProxyError
 
 import searx.network
+from searx import get_setting
+from searx.network import THREADLOCAL, set_isolation_for_thread, release_isolation
 from searx.exceptions import (
     SearxEngineAccessDeniedException,
     SearxEngineCaptchaException,
@@ -175,6 +178,10 @@ class OnlineProcessor(EngineProcessor):
         for key in ("curl_options", "impersonate", "default_headers"):
             if params.get(key) is not None:
                 request_args[key] = params[key]
+        # shaded: per-engine browser profile from settings.yml (``impersonate: tor145``)
+        impersonate = getattr(self.engine, "impersonate", None)
+        if impersonate:
+            request_args["impersonate"] = impersonate
 
         verify = params.get("verify")
         if verify is not None:
@@ -242,6 +249,50 @@ class OnlineProcessor(EngineProcessor):
         response.search_params = params
         return self.engine.response(response)
 
+    def _search_with_fresh_circuits(
+        self,
+        query: str,
+        params: OnlineParams,
+        network: t.Any,
+        result_container: "ResultContainer",
+        start_time: float,
+        timeout_limit: float,
+        fresh_isolations: list[str],
+    ) -> "EngineResults|None":
+        """shaded: on an isolated Tor route, a 429 / access-denied / CAPTCHA is
+        usually about one exit (shared by many Tor users), not about us.  Retry on
+        a fresh circuit up to ``fresh_circuit_retries`` times (engine setting, else
+        ``outgoing.fresh_circuit_retries``) while at least ``2 s`` of the engine's
+        time is left."""
+        retries = getattr(self.engine, "fresh_circuit_retries", None)
+        if retries is None:
+            retries = get_setting("outgoing.fresh_circuit_retries", 0)
+        isolation = THREADLOCAL.__dict__.get("isolation")
+        if not (retries and isolation and network is not None and network.route == "tor" and network.isolate):
+            return self._search_basic(query, params)
+
+        attempt = 0
+        pristine = copy.deepcopy(params)
+        while True:
+            try:
+                return self._search_basic(query, params)
+            except (
+                SearxEngineCaptchaException,
+                SearxEngineTooManyRequestsException,
+                SearxEngineAccessDeniedException,
+            ):
+                remaining = timeout_limit - (default_timer() - start_time)
+                if attempt >= retries or remaining < 2.0:
+                    raise
+            attempt += 1
+            search_id, engine_name = isolation.split(":", 1)
+            fresh = f"{search_id}~{attempt}:{engine_name}"
+            set_isolation_for_thread(fresh)
+            result_container.note_engine(self.engine.name, "sent", fresh_circuits=attempt)
+            params = copy.deepcopy(pristine)
+            # closed by search() when the engine is done
+            fresh_isolations.append(fresh)
+
     def search(  # pyright: ignore[reportIncompatibleMethodOverride]
         self,
         query: str,
@@ -251,6 +302,7 @@ class OnlineProcessor(EngineProcessor):
         timeout_limit: float,
     ):
         self.init_network_in_thread(start_time, timeout_limit)
+        fresh_isolations: list[str] = []
 
         # shaded: on a proxied route with per-query isolation, a transport error
         # belongs to one circuit / tunnel, not to the engine; the next search
@@ -260,7 +312,9 @@ class OnlineProcessor(EngineProcessor):
 
         try:
             # send requests and parse the results
-            search_results = self._search_basic(query, params)
+            search_results = self._search_with_fresh_circuits(
+                query, params, network, result_container, start_time, timeout_limit, fresh_isolations
+            )
             self.extend_container(result_container, start_time, search_results)
         except ssl.SSLError as e:
             # requests timeout (connect or read)
@@ -293,3 +347,6 @@ class OnlineProcessor(EngineProcessor):
         except Exception as e:  # pylint: disable=broad-except
             self.handle_exception(result_container, e)
             self.logger.debug("exception : {0}".format(e))
+        finally:
+            for fresh in fresh_isolations:
+                release_isolation(fresh)

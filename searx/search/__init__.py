@@ -6,6 +6,7 @@ __all__ = ["SearchWithPlugins"]
 import typing as t
 
 import threading
+import time
 from timeit import default_timer
 from uuid import uuid4
 
@@ -62,6 +63,7 @@ class Search:
         self.result_container: ResultContainer = ResultContainer()
         self.start_time: float | None = None
         self.actual_timeout: float | None = None
+        self._deadline_reached: bool = False
 
     def search_external_bang(self) -> bool:
         """Check if there is a external bang.  If yes, update
@@ -186,14 +188,39 @@ class Search:
             th._engine_name = engine_name
             th.start()
 
-        for th in threading.enumerate():  # pylint: disable=invalid-name
-            if th.name == search_id:
-                remaining_time = max(0.0, self.actual_timeout - (default_timer() - self.start_time))
-                th.join(remaining_time)
-                if th.is_alive():
-                    th._timeout = True
-                    self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')
-                    PROCESSORS[th._engine_name].logger.error('engine timeout')
+        threads = [th for th in threading.enumerate() if th.name == search_id]
+        deadline = settings['search'].get('deadline')
+        if deadline is not None:
+            self._wait_for_deadline(threads, float(deadline))
+
+        for th in threads:  # pylint: disable=invalid-name
+            remaining_time = max(0.0, self.actual_timeout - (default_timer() - self.start_time))
+            if deadline is not None and getattr(self, '_deadline_reached', False):
+                remaining_time = 0.0
+            th.join(remaining_time)
+            if th.is_alive():
+                th._timeout = True
+                self.result_container.add_unresponsive_engine(th._engine_name, 'timeout')
+                late = deadline is not None and getattr(self, '_deadline_reached', False)
+                self.result_container.note_engine(th._engine_name, 'late' if late else 'timeout')
+                PROCESSORS[th._engine_name].logger.error('engine timeout')
+
+    def _wait_for_deadline(self, threads: list[threading.Thread], deadline: float):
+        """shaded: wait until every engine is done, or until ``deadline`` seconds
+        have passed and at least ``search.deadline_min_answered`` engines answered
+        with results; never longer than the upstream timeout."""
+        min_answered = int(settings['search'].get('deadline_min_answered', 1))
+        self._deadline_reached = False
+        while True:
+            elapsed = default_timer() - self.start_time
+            if not any(th.is_alive() for th in threads) or elapsed >= self.actual_timeout:
+                return
+            if elapsed >= deadline:
+                answered = sum(1 for e in self.result_container.coverage.values() if e.get('status') == 'ok')
+                if answered >= min_answered:
+                    self._deadline_reached = True
+                    return
+            time.sleep(0.05)
 
     def search_standard(self):
         """

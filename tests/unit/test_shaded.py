@@ -3,6 +3,8 @@
 """Tests for the shaded-searxng patches: routes, isolation, backoff, ShadeNet budget, coverage."""
 
 import copy
+import threading
+import time
 from unittest.mock import patch
 
 import searx
@@ -281,6 +283,8 @@ class TestTransportErrorsDoNotSuspend(SearxTestCase):
         ):
             proc = online.OnlineProcessor(engine)
         proc.init_network_in_thread = lambda *a: None
+        # SUSPENDED_STATUS is keyed by id(network); ids are reused across tests
+        proc.suspended_status = SuspendedStatus()
         return proc, online
 
     def _run(self, network, exc):
@@ -321,3 +325,163 @@ class TestTransportErrorsDoNotSuspend(SearxTestCase):
 
         plain = Network(proxies=TOR, using_tor_proxy=True, isolate=False)
         self.assertEqual(self._run(plain, Timeout("t")), 1)
+
+
+class TestDeadline(SearxTestCase):
+
+    def _search(self, timeout=5.0):
+        from searx.search import Search  # pylint: disable=import-outside-toplevel
+
+        search = Search.__new__(Search)
+        search.result_container = ResultContainer()
+        search.start_time = __import__('timeit').default_timer()
+        search.actual_timeout = timeout
+        search._deadline_reached = False
+        return search
+
+    def _threads(self, *durations):
+        threads = [threading.Thread(target=time.sleep, args=(d,)) for d in durations]
+        for th in threads:
+            th.start()
+        return threads
+
+    def setUp(self):
+        super().setUp()
+        previous = copy.deepcopy(searx.settings['search'])
+        self.addCleanup(lambda: searx.settings.__setitem__('search', previous))
+        searx.settings['search']['deadline_min_answered'] = 1
+
+    def test_returns_at_deadline_once_answered(self):
+        search = self._search()
+        search.result_container.note_engine('bing', 'ok', results=10)
+        threads = self._threads(0.05, 3.0)
+        t0 = time.monotonic()
+        search._wait_for_deadline(threads, 0.3)
+        self.assertLess(time.monotonic() - t0, 1.0)
+        self.assertTrue(search._deadline_reached)
+
+    def test_keeps_waiting_without_answers(self):
+        search = self._search(timeout=0.8)
+        threads = self._threads(3.0)
+        t0 = time.monotonic()
+        search._wait_for_deadline(threads, 0.2)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.7)  # waited for the upstream timeout
+        self.assertFalse(search._deadline_reached)
+
+    def test_all_done_before_deadline(self):
+        search = self._search()
+        threads = self._threads(0.05)
+        t0 = time.monotonic()
+        search._wait_for_deadline(threads, 2.0)
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertFalse(search._deadline_reached)
+
+
+class TestFreshCircuit(TestTransportErrorsDoNotSuspend):
+
+    def setUp(self):
+        super().setUp()
+        previous = copy.deepcopy(searx.settings['outgoing'])
+        self.addCleanup(lambda: searx.settings.__setitem__('outgoing', previous))
+        searx.settings['outgoing']['fresh_circuit_retries'] = 1
+
+    def test_retry_on_fresh_circuit(self):
+        from searx.exceptions import SearxEngineTooManyRequestsException  # pylint: disable=import-outside-toplevel
+
+        network = Network(proxies=TOR, using_tor_proxy=True, isolate=True)
+        proc, online = self._processor(network)
+        seen = []
+
+        def basic(q, p):
+            seen.append(searx.network.THREADLOCAL.__dict__.get('isolation'))
+            if len(seen) == 1:
+                raise SearxEngineTooManyRequestsException()
+            return None  # accepted, no results to merge
+
+        proc._search_basic = basic
+        rc = ResultContainer()
+        searx.network.set_isolation_for_thread('sid:arxiv')
+        self.addCleanup(searx.network.set_isolation_for_thread, None)
+        with (
+            patch.object(online.searx.network, 'get_network', lambda name=None: network),
+            patch.dict('searx.engines.engines', {'arxiv': type('E', (), {'display_error_messages': True})}),
+            patch('searx.search.processors.abstract.counter_inc'),
+            patch('searx.search.processors.abstract.histogram_observe'),
+            patch.object(online, 'release_isolation') as release,
+        ):
+            proc.search('q', {}, rc, __import__('timeit').default_timer(), 6)
+        self.assertEqual(seen, ['sid:arxiv', 'sid~1:arxiv'])
+        release.assert_called_once_with('sid~1:arxiv')
+        self.assertEqual(rc.coverage['arxiv']['fresh_circuits'], 1)
+        self.assertEqual(rc.coverage['arxiv']['status'], 'sent')  # no error recorded
+        self.assertEqual(proc.suspended_status.continuous_errors, 0)
+
+    def test_no_retry_off_tor(self):
+        from searx.exceptions import SearxEngineTooManyRequestsException  # pylint: disable=import-outside-toplevel
+
+        network = Network(proxies=SHADENET, route='shadenet', isolate=True)
+        calls = []
+
+        def basic(q, p):
+            calls.append(1)
+            raise SearxEngineTooManyRequestsException()
+
+        self.assertEqual(self._run_with(network, basic), 1)
+        self.assertEqual(len(calls), 1)
+
+    def _run_with(self, network, basic):
+        proc, online = self._processor(network)
+        proc._search_basic = basic
+        rc = ResultContainer()
+        searx.network.set_isolation_for_thread('sid:arxiv')
+        self.addCleanup(searx.network.set_isolation_for_thread, None)
+        with (
+            patch.object(online.searx.network, 'get_network', lambda name=None: network),
+            patch.dict('searx.engines.engines', {'arxiv': type('E', (), {'display_error_messages': True})}),
+            patch('searx.search.processors.abstract.counter_inc'),
+            patch('searx.search.processors.abstract.count_exception'),
+            patch('searx.search.processors.abstract.count_error'),
+        ):
+            proc.search('q', {}, rc, __import__('timeit').default_timer(), 6)
+        return proc.suspended_status.continuous_errors
+
+
+class TestImpersonateOverride(TestTransportErrorsDoNotSuspend):
+
+    def test_engine_setting_wins(self):
+        network = Network(proxies=TOR, using_tor_proxy=True, isolate=True)
+        proc, online = self._processor(network)
+        proc.engine.impersonate = 'tor145'
+        params = {
+            'headers': {},
+            'cookies': {},
+            'auth': None,
+            'impersonate': 'chrome99_android',
+            'method': 'GET',
+            'url': 'https://example.org/',
+        }
+        response = type('R', (), {'history': []})()
+        with patch.object(online.searx.network, 'get', return_value=response) as get:
+            proc._send_http_request(params)
+        self.assertEqual(get.call_args.kwargs['impersonate'], 'tor145')
+
+
+class TestHackernewsAlgolia(SearxTestCase):
+
+    def test_algolia_direct_mode(self):
+        from searx.engines import hackernews  # pylint: disable=import-outside-toplevel
+
+        with (
+            patch.object(hackernews, 'algolia_app_id', 'UJ5WYC0L7X'),
+            patch.object(hackernews, 'algolia_search_key', 'public-search-key'),
+        ):
+            params = hackernews.request('tor', {'pageno': 1, 'time_range': None, 'headers': {}})
+        self.assertTrue(params['url'].startswith('https://uj5wyc0l7x-dsn.algolia.net/1/indexes/Item_dev?'))
+        self.assertEqual(params['headers']['X-Algolia-Application-Id'], 'UJ5WYC0L7X')
+        self.assertEqual(params['headers']['X-Algolia-API-Key'], 'public-search-key')
+
+    def test_default_mode_unchanged(self):
+        from searx.engines import hackernews  # pylint: disable=import-outside-toplevel
+
+        params = hackernews.request('tor', {'pageno': 1, 'time_range': None, 'headers': {}})
+        self.assertTrue(params['url'].startswith('https://hn.algolia.com/api/v1/search?'))
