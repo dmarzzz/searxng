@@ -485,3 +485,54 @@ class TestHackernewsAlgolia(SearxTestCase):
 
         params = hackernews.request('tor', {'pageno': 1, 'time_range': None, 'headers': {}})
         self.assertTrue(params['url'].startswith('https://hn.algolia.com/api/v1/search?'))
+
+
+class TestCircuitPool(SearxTestCase):
+
+    def test_keys_are_warmed_once_and_expire(self):
+        from searx.network.circuits import CircuitPool  # pylint: disable=import-outside-toplevel
+
+        pool = CircuitPool(TOR, size=3, builders=1, max_age=60)
+        warmed = []
+        pool.warm = lambda key: warmed.append(key) or True
+        pool.start()
+        deadline = time.monotonic() + 5
+        while pool.stats()['ready'] < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        pool.stop()
+        keys = [pool.take() for _ in range(3)]
+        self.assertEqual(len(set(keys)), 3)
+        self.assertTrue(set(keys) <= set(warmed))
+        self.assertIsNone(pool.take())  # empty: the search builds its circuit inline
+        self.assertEqual(pool.stats()['misses'], 1)
+
+    def test_stale_keys_are_dropped(self):
+        from searx.network.circuits import CircuitPool  # pylint: disable=import-outside-toplevel
+
+        pool = CircuitPool(TOR, size=2, builders=1, max_age=60)
+        pool._keys.put((time.monotonic() - 120, 'old'))
+        pool._keys.put((time.monotonic(), 'fresh'))
+        self.assertEqual(pool.take(), 'fresh')
+
+    def test_warm_uses_the_key_as_socks_username(self):
+        from searx.network import circuits  # pylint: disable=import-outside-toplevel
+
+        pool = circuits.CircuitPool(TOR, size=1, builders=1)
+        response = type('R', (), {'status_code': 200})()
+        with patch.object(circuits.curl_requests, 'get', return_value=response) as get:
+            self.assertTrue(pool.warm('k1'))
+        self.assertEqual(get.call_args.kwargs['proxy'], _isolated_proxy_url(TOR, 'k1'))
+
+
+class TestDuckDuckGoBrowserGet(SearxTestCase):
+
+    def test_first_page_is_a_plain_get(self):
+        from searx.engines import duckduckgo  # pylint: disable=import-outside-toplevel
+
+        params = {'pageno': 1, 'headers': {}, 'data': {}, 'searxng_locale': 'all', 'method': 'GET'}
+        with patch.object(duckduckgo, 'browser_get', True):
+            duckduckgo.request('tor exit blocking', params)
+        self.assertEqual(params['method'], 'GET')
+        self.assertEqual(params['url'], 'https://html.duckduckgo.com/html/?q=tor+exit+blocking')
+        self.assertEqual(params['headers'], {})  # every header comes from the browser profile
+        self.assertEqual(params['data']['q'], 'tor exit blocking')

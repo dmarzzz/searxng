@@ -283,6 +283,12 @@ SCHEMA: dict[str, t.Any] = {
         'isolate': SettingsValue((bool, str), False),
         # shaded: retry an engine on a fresh Tor circuit after a 429 / 403 / CAPTCHA
         'fresh_circuit_retries': SettingsValue(int, 0),
+        # shaded: keep this many isolated Tor circuits built ahead of time
+        # (searx.network.circuits); 0 disables the pool
+        'circuit_pool': {
+            'size': SettingsValue(int, 0),
+            'builders': SettingsValue(int, 4),
+        },
         # shaded: ShadeNet proxy budget (see searx.search.shadenet)
         'shadenet': {
             'url': SettingsValue((None, str), None),

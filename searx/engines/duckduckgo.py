@@ -170,6 +170,7 @@ Terms / phrases that you keep coming across:
 import json
 import re
 import typing as t
+from urllib.parse import urlencode
 
 import babel
 
@@ -208,6 +209,13 @@ safesearch: bool = True
 """DDG-lite: user can't select but the results are filtered."""
 
 ddg_url: str = "https://html.duckduckgo.com/html/"
+
+# shaded: request the first page as a plain GET and leave every header to the
+# browser profile (``impersonate``).  The default POST with a static User-Agent
+# next to a curl_cffi browser TLS fingerprint is a mismatch DDG answers with a
+# CAPTCHA; a GET with the profile's own headers got results through 9 of 10
+# ShadeNet nodes.  Later pages still need the vqd and use the POST form.
+browser_get: bool = False
 """The process flow for determining the ``vqd`` values was implemented for the
 no-JS variant (DDG-html)"""
 
@@ -359,7 +367,13 @@ def quote_ddg_bangs(query: str) -> str:
     return " ".join(_q)
 
 
-def request(query: str, params: "OnlineParams") -> None:
+def _browser_get_request(query: str, params: "OnlineParams") -> None:
+    params["url"] = f"{ddg_url}?{urlencode({'q': query})}"
+    params["method"] = "GET"
+    params["data"]["q"] = query  # read back by response()
+
+
+def request(query: str, params: "OnlineParams") -> None:  # pylint: disable=too-many-statements
 
     if len(query) >= 500:
         # DDG does not accept queries with more than 499 chars
@@ -367,6 +381,9 @@ def request(query: str, params: "OnlineParams") -> None:
         return
 
     query = quote_ddg_bangs(query)
+    if browser_get and params["pageno"] == 1:
+        _browser_get_request(query, params)
+        return
     eng_region: str = traits.get_region(
         params["searxng_locale"],
         traits.all_locale,
@@ -480,7 +497,8 @@ def response(resp: "SXNG_Response") -> EngineResults:
 
     # Some locales (at least China) do not have a "next page" button and DDG
     # will return a HTTP/2 403 Forbidden for a request of such a page.
-    if len(form):
+    # shaded: a browser_get request has no static User-Agent to key the vqd cache on
+    if len(form) and "User-Agent" in params["headers"]:
         form = form[0]
         form_vqd = eval_xpath(form, '//input[@name="vqd"]/@value')[0]
         q: str = str(params["data"]["q"])

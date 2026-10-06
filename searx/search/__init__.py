@@ -19,6 +19,7 @@ import searx.plugins
 from searx.engines import load_engines
 from searx.external_bang import get_bang_url
 from searx.metrics import initialize as initialize_metrics, counter_inc
+from searx.network import circuits
 from searx.network import (
     initialize as initialize_network,
     check_network_configuration,
@@ -46,6 +47,7 @@ def initialize(
     settings_engines = settings_engines or settings['engines']
     load_engines(settings_engines)
     initialize_network(settings_engines, settings['outgoing'])
+    _start_circuit_pool()
     if check_network:
         check_network_configuration()
     initialize_metrics([engine['name'] for engine in settings_engines], enable_metrics)
@@ -172,7 +174,10 @@ class Search:
 
     def search_multiple_requests(self, requests: list[tuple[str, str, RequestParams]]):
         # pylint: disable=protected-access
-        search_id = str(uuid4())
+        # shaded: a pre-built circuit's key doubles as the search id (unique, used once)
+        pooled = circuits.take() if settings['outgoing'].get('isolate') else None
+        search_id = pooled or str(uuid4())
+        self.result_container.circuit = 'pooled' if pooled else 'inline'
         isolate = bool(settings['outgoing'].get('isolate'))
 
         for engine_name, query, request_params in requests:
@@ -242,6 +247,21 @@ class Search:
             if not self.search_answerers():
                 self.search_standard()
         return self.result_container
+
+
+def _start_circuit_pool():
+    """shaded: pre-build isolated Tor circuits when the default route is an
+    isolated Tor proxy (outgoing.circuit_pool.size > 0)."""
+    pool = settings['outgoing'].get('circuit_pool') or {}
+    network = get_network()
+    if not pool.get('size') or network is None or network.route != 'tor' or not network.isolate:
+        return
+    proxies = network.proxies
+    proxy_url = proxies if isinstance(proxies, str) else next(iter(proxies.values()), None)
+    if isinstance(proxy_url, list):
+        proxy_url = proxy_url[0]
+    if proxy_url:
+        circuits.start(proxy_url, int(pool['size']), int(pool.get('builders', 4)))
 
 
 def _isolated(search_function: t.Callable[..., t.Any], isolation: str | None) -> t.Callable[..., t.Any]:

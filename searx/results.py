@@ -75,6 +75,8 @@ class ResultContainer:
         self.unresponsive_engines: set[UnresponsiveEngine] = set()
         self.timings: list[Timing] = []
         self.coverage: dict[str, dict[str, t.Any]] = {}
+        # shaded: "pooled" (pre-built Tor circuit), "inline" or None
+        self.circuit: str | None = None
         """shaded: per engine route, status, result count and time (see note_engine)."""
         self.redirect_url: str | None = None
         self.on_result: t.Callable[[Result | LegacyResult], bool] = lambda _: True
@@ -291,6 +293,7 @@ class ResultContainer:
             'routes_used': routes_used,
             'answered': sum(1 for e in engines.values() if e['status'] == 'ok'),
             'queried': sum(1 for e in engines.values() if e['status'] not in ('suspended', 'capped', 'budget')),
+            'circuit': self.circuit,
         }
 
     def add_timing(self, engine_name: str, engine_time: float, page_load_time: float):
