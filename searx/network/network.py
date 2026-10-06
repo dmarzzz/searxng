@@ -10,8 +10,10 @@ from collections.abc import Generator
 
 import atexit
 import asyncio
+import hashlib
 import ipaddress
 from itertools import cycle
+from urllib.parse import urlsplit, urlunsplit
 
 from curl_cffi import CurlHttpVersion
 from curl_cffi.requests.exceptions import (
@@ -44,6 +46,34 @@ PROXY_PATTERN_MAPPING = {
 
 ADDRESS_MAPPING = {'ipv4': '0.0.0.0', 'ipv6': '::'}
 
+ROUTES = ('tor', 'shadenet', 'proxy', 'direct')
+"""shaded: the egress route of a network.  ``tor`` and ``shadenet`` are proxied
+routes, ``proxy`` is any other proxy, ``direct`` is the open internet and must be
+chosen explicitly when ``outgoing.require_route`` is set."""
+
+
+class NoRouteError(ProxyError):
+    """shaded: a request on a network that has no permitted route.  Raised instead
+    of silently sending the request without a proxy."""
+
+
+def _isolated_proxy_url(proxy_url: str, isolation: str) -> str:
+    """shaded: put a per-isolation SOCKS username on a SOCKS proxy URL.
+
+    Tor's ``IsolateSOCKSAuth`` (on by default) never shares a circuit between
+    streams with different SOCKS credentials.  Non-SOCKS proxy URLs are returned
+    unchanged: they get a new client (and so a new CONNECT tunnel) per isolation
+    id instead."""
+    parts = urlsplit(proxy_url)
+    if not parts.scheme.startswith('socks'):
+        return proxy_url
+    user = 'sx' + hashlib.sha256(isolation.encode()).hexdigest()[:24]
+    host = parts.hostname or ''
+    if ':' in host:
+        host = f'[{host}]'
+    netloc = f'{user}:x@{host}' + (f':{parts.port}' if parts.port else '')
+    return urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+
 
 @t.final
 class Network:
@@ -60,9 +90,12 @@ class Network:
         'max_redirects',
         'retries',
         'retry_on_http_error',
+        'route',
+        'isolate',
         '_local_addresses_cycle',
         '_proxies_cycle',
         '_clients',
+        '_iso_keys',
         '_logger',
     )
 
@@ -70,7 +103,7 @@ class Network:
     _CLIENT_KWARGS = ('verify', 'max_redirects', 'impersonate', 'curl_options', 'enable_http3')
 
     def __init__(
-        # pylint: disable=too-many-arguments
+        # pylint: disable=too-many-arguments, too-many-positional-arguments
         self,
         enable_http: bool = True,
         verify: bool = True,
@@ -84,6 +117,9 @@ class Network:
         retry_on_http_error: bool = False,
         max_redirects: int = 30,
         logger_name: str = None,  # pyright: ignore[reportArgumentType]
+        route: str | None = None,
+        require_route: bool = False,
+        isolate: bool | str = False,
     ):
 
         self.enable_http = enable_http
@@ -100,8 +136,27 @@ class Network:
         self._local_addresses_cycle = self.get_ipaddress_cycle()
         self._proxies_cycle = self.get_proxy_cycles()
         self._clients = {}
+        self._iso_keys: dict[str, list[tuple[t.Any, ...]]] = {}
         self._logger = logger.getChild(logger_name) if logger_name else logger
+        self.route = self.resolve_route(route, require_route)
+        if isolate not in (False, True, 'query', 'engine'):
+            raise ValueError("isolate has to be false, true / 'query' or 'engine'")
+        self.isolate = 'query' if isolate is True else isolate
         self.check_parameters()
+
+    def resolve_route(self, route: str | None, require_route: bool) -> str | None:
+        """shaded: the network's route, or ``None`` when it may not send anything."""
+        if route is not None and route not in ROUTES:
+            raise ValueError(f'route has to be one of {ROUTES}, not {route!r}')
+        if route == 'direct':
+            if self.proxies:
+                raise ValueError('route: direct with proxies set')
+            return 'direct'
+        if not self.proxies:
+            if route is not None:
+                raise ValueError(f'route: {route} without proxies')
+            return None if require_route else 'direct'
+        return route or ('tor' if self.using_tor_proxy else 'proxy')
 
     def check_parameters(self):
         for address in self.iter_ipaddresses():
@@ -198,15 +253,27 @@ class Network:
         impersonate: str | None = None,
         curl_options: dict[int, t.Any] | None = None,
         enable_http3: bool | None = None,
+        isolation: str | None = None,
     ) -> AsyncClient:
+        if self.route is None:
+            raise NoRouteError('Network configuration problem: no route (outgoing.require_route)')
+        if not (self.isolate and self.proxies):
+            isolation = None
         verify = self.verify if verify is None else verify
         max_redirects = self.max_redirects if max_redirects is None else max_redirects
         impersonate = impersonate or DEFAULT_IMPERSONATE
         enable_http3 = self.enable_http3 if enable_http3 is None else enable_http3
         local_address = next(self._local_addresses_cycle)
         proxies = next(self._proxies_cycle)  # is a tuple so it can be part of the key
+        tor_check_key = proxies
+        if isolation is not None:
+            # isolation ids are "<search id>:<engine>"; in "query" mode the engines of
+            # one search share a Tor circuit (one SOCKS username per search) but still
+            # get their own client, so their own ShadeNet tunnel
+            circuit = isolation if self.isolate == 'engine' else isolation.split(':', 1)[0]
+            proxies = tuple((pattern, _isolated_proxy_url(url, circuit)) for pattern, url in proxies)
         curl_key = tuple(sorted((int(k), v) for k, v in (curl_options or {}).items()))
-        key = (verify, max_redirects, local_address, proxies, impersonate, curl_key, enable_http3)
+        key = (verify, max_redirects, local_address, proxies, impersonate, curl_key, enable_http3, isolation)
         if key not in self._clients or self._clients[key].is_closed:
             client = new_client(
                 self.enable_http,
@@ -220,11 +287,23 @@ class Network:
                 impersonate=impersonate,
                 curl_options=curl_options,
             )
-            if self.using_tor_proxy and not await self.check_tor_proxy(client, proxies):
+            if self.using_tor_proxy and not await self.check_tor_proxy(client, tor_check_key):
                 await client.aclose()
                 raise ProxyError('Network configuration problem: not using Tor')
             self._clients[key] = client
+            if isolation is not None:
+                self._iso_keys.setdefault(isolation, []).append(key)
         return self._clients[key]
+
+    async def release(self, isolation: str):
+        """shaded: close the clients of one isolation id (connection reuse OFF)."""
+        for key in self._iso_keys.pop(isolation, []):
+            client = self._clients.pop(key, None)
+            if client is not None:
+                try:
+                    await client.aclose()
+                except RequestException:
+                    pass
 
     async def aclose(self):
         async def close_client(client):
@@ -273,8 +352,9 @@ class Network:
         was_disconnected = False
         do_raise_for_httperror = Network.extract_do_raise_for_httperror(kwargs)
         kwargs_clients = Network.extract_kwargs_clients(kwargs)
+        isolation = kwargs.pop('isolation', None)
         while retries >= 0:  # pragma: no cover
-            client = await self.get_client(**kwargs_clients)
+            client = await self.get_client(isolation=isolation, **kwargs_clients)
             try:
                 method = method.upper()
                 if stream:
@@ -316,11 +396,21 @@ def get_network(name: str | None = None) -> "Network":
     return NETWORKS.get(name or DEFAULT_NAME)  # pyright: ignore[reportReturnType]
 
 
+def release_isolation(isolation: str):
+    """shaded: close every client opened for ``isolation`` (does not wait)."""
+    loop = get_loop()
+    if not loop:
+        return
+    for network in {id(n): n for n in NETWORKS.values()}.values():
+        if isolation in network._iso_keys:  # pylint: disable=protected-access
+            asyncio.run_coroutine_threadsafe(network.release(isolation), loop)
+
+
 def check_network_configuration():
     async def check():
         exception_count = 0
         for network in NETWORKS.values():
-            if network.using_tor_proxy:
+            if network.using_tor_proxy and network.route is not None:
                 try:
                     await network.get_client()
                 except Exception:  # pylint: disable=broad-except
@@ -359,6 +449,8 @@ def initialize(
         'max_redirects': settings_outgoing['max_redirects'],
         'retries': settings_outgoing['retries'],
         'retry_on_http_error': False,
+        'require_route': settings_outgoing.get('require_route', False),
+        'isolate': settings_outgoing.get('isolate', False),
     }
 
     def new_network(params: dict[str, t.Any], logger_name: str | None = None):
@@ -400,6 +492,9 @@ def initialize(
                     network[attribute_name] = getattr(engine, attribute_name)
                 else:
                     network[attribute_name] = attribute_value
+            # shaded: an engine's class default (False) must not switch off the
+            # global outgoing.using_tor_proxy (it would also mislabel the route)
+            network['using_tor_proxy'] = default_params['using_tor_proxy'] or getattr(engine, 'using_tor_proxy', False)
             NETWORKS[engine_name] = new_network(network, logger_name=engine_name)
         elif isinstance(network, dict):
             NETWORKS[engine_name] = new_network(network, logger_name=engine_name)

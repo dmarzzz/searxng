@@ -200,6 +200,14 @@ SCHEMA: dict[str, t.Any] = {
         'languages': SettingSublistValue(SXNG_LOCALE_TAGS, SXNG_LOCALE_TAGS),  # type: ignore
         'ban_time_on_fail': SettingsValue(numbers.Real, 5),
         'max_ban_time_on_fail': SettingsValue(numbers.Real, 120),
+        # shaded: exponential suspension with a cap, and one probe after expiry
+        'suspend_backoff': {
+            'enabled': SettingsValue(bool, False),
+            'base': SettingsValue(numbers.Real, 30),
+            'factor': SettingsValue(numbers.Real, 4),
+            'max': SettingsValue(numbers.Real, 3600),
+            'probe_timeout': SettingsValue(numbers.Real, 60),
+        },
         'suspended_times': {
             'SearxEngineAccessDenied': SettingsValue(numbers.Real, 86400),
             'SearxEngineCaptcha': SettingsValue(numbers.Real, 86400),
@@ -263,6 +271,18 @@ SCHEMA: dict[str, t.Any] = {
         # Tor configuration
         'using_tor_proxy': SettingsValue(bool, False),
         'extra_proxy_timeout': SettingsValue(int, 0),
+        # shaded: refuse any request on a network without a proxy, unless the
+        # network says ``route: direct``
+        'require_route': SettingsValue(bool, False),
+        # shaded: false, true / "query" (one Tor circuit per search, one ShadeNet
+        # tunnel per engine) or "engine" (one Tor circuit per search and engine)
+        'isolate': SettingsValue((bool, str), False),
+        # shaded: ShadeNet proxy budget (see searx.search.shadenet)
+        'shadenet': {
+            'url': SettingsValue((None, str), None),
+            'token_file': SettingsValue((None, str), None),
+            'max_engines_per_query': SettingsValue(int, 1),
+        },
         'networks': {},
     },
     'plugins': SettingsValue(dict, {}),

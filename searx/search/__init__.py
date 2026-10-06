@@ -18,10 +18,17 @@ import searx.plugins
 from searx.engines import load_engines
 from searx.external_bang import get_bang_url
 from searx.metrics import initialize as initialize_metrics, counter_inc
-from searx.network import initialize as initialize_network, check_network_configuration
+from searx.network import (
+    initialize as initialize_network,
+    check_network_configuration,
+    get_network,
+    set_isolation_for_thread,
+    release_isolation,
+)
 from searx.results import ResultContainer
 from searx.search.processors import PROCESSORS
 from searx.search.processors.abstract import RequestParams
+from searx.search import shadenet
 
 if t.TYPE_CHECKING:
     from .models import SearchQuery
@@ -82,12 +89,28 @@ class Search:
         # max of all selected engine timeout
         default_timeout = 0
 
+        # shaded: at most N ShadeNet engines per search, the healthiest first
+        shadenet_candidates = [
+            (ref.name, PROCESSORS[ref.name])
+            for ref in self.search_query.engineref_list
+            if ref.name in PROCESSORS and shadenet.is_shadenet(ref.name)
+        ]
+        shadenet_allowed = shadenet.allowed_engines(shadenet_candidates)
+
         # start search-request for all selected engines
         for engineref in self.search_query.engineref_list:
             processor = PROCESSORS.get(engineref.name)
             if not processor:
                 # engine does not exists; not yet or the 'init' method of the
                 # engine has been failed and the engine has not been registered.
+                continue
+
+            network = get_network(engineref.name)
+            route = network.route if network else None
+            self.result_container.note_engine(engineref.name, 'sent', route=route)
+
+            if route == 'shadenet' and engineref.name not in shadenet_allowed:
+                self.result_container.note_engine(engineref.name, 'capped')
                 continue
 
             # stop the request now if the engine is suspend
@@ -97,6 +120,7 @@ class Search:
             # set default request parameters
             request_params = processor.get_params(self.search_query, engineref.category)
             if request_params is None:
+                self.result_container.note_engine(engineref.name, 'unsupported')
                 continue
 
             counter_inc('engine', engineref.name, 'search', 'count', 'sent')
@@ -131,14 +155,28 @@ class Search:
             )
         )
 
+        # shaded: skip the ShadeNet engines when their tunnels cannot open in time
+        shadenet_requests = [r for r in requests if shadenet.is_shadenet(r[0])]
+        if shadenet_requests:
+            plan = shadenet.plan(len(shadenet_requests))
+            if not shadenet.fits(plan, actual_timeout):
+                for engine_name, _, _ in shadenet_requests:
+                    self.result_container.note_engine(
+                        engine_name, 'budget', retry_in=plan.get('completesInSeconds') if plan else None
+                    )
+                requests = [r for r in requests if not shadenet.is_shadenet(r[0])]
+
         return requests, actual_timeout
 
     def search_multiple_requests(self, requests: list[tuple[str, str, RequestParams]]):
         # pylint: disable=protected-access
         search_id = str(uuid4())
+        isolate = bool(settings['outgoing'].get('isolate'))
 
         for engine_name, query, request_params in requests:
-            _search = copy_current_request_context(PROCESSORS[engine_name].search)
+            _search = copy_current_request_context(
+                _isolated(PROCESSORS[engine_name].search, f'{search_id}:{engine_name}' if isolate else None)
+            )
             th = threading.Thread(  # pylint: disable=invalid-name
                 target=_search,
                 args=(query, request_params, self.result_container, self.start_time, self.actual_timeout),
@@ -177,6 +215,21 @@ class Search:
             if not self.search_answerers():
                 self.search_standard()
         return self.result_container
+
+
+def _isolated(search_function: t.Callable[..., t.Any], isolation: str | None) -> t.Callable[..., t.Any]:
+    """shaded: run an engine's search on its own circuit / tunnel, then close it."""
+
+    def run(*args: t.Any):
+        set_isolation_for_thread(isolation)
+        try:
+            return search_function(*args)
+        finally:
+            set_isolation_for_thread(None)
+            if isolation is not None:
+                release_isolation(isolation)
+
+    return run
 
 
 class SearchWithPlugins(Search):

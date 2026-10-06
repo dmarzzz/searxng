@@ -1,7 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # pylint: disable=missing-module-docstring, global-statement
 
-__all__ = ["get_network", "initialize", "check_network_configuration", "raise_for_httperror"]
+__all__ = [
+    "get_network",
+    "initialize",
+    "check_network_configuration",
+    "raise_for_httperror",
+    "set_isolation_for_thread",
+    "release_isolation",
+]
 
 import typing as t
 
@@ -17,7 +24,12 @@ from contextlib import contextmanager
 from curl_cffi.requests.exceptions import StreamConsumedError, Timeout
 
 from searx.extended_types import SXNG_Response
-from .network import get_network, initialize, check_network_configuration  # pylint:disable=cyclic-import
+from .network import (  # pylint:disable=cyclic-import
+    get_network,
+    initialize,
+    check_network_configuration,
+    release_isolation,
+)
 from .client import get_loop
 from .raise_for_httperror import raise_for_httperror
 
@@ -44,6 +56,18 @@ def set_timeout_for_thread(timeout: float, start_time: float | None = None):
 
 def set_context_network_name(network_name: str):
     THREADLOCAL.network = get_network(network_name)
+
+
+def set_isolation_for_thread(isolation: str | None):
+    """shaded: requests from this thread use their own circuit / tunnel."""
+    THREADLOCAL.isolation = isolation
+
+
+def _with_isolation(kwargs: dict[str, t.Any]) -> dict[str, t.Any]:
+    isolation = THREADLOCAL.__dict__.get('isolation')
+    if isolation is not None:
+        kwargs.setdefault('isolation', isolation)
+    return kwargs
 
 
 def get_context_network() -> "Network":
@@ -97,7 +121,7 @@ def request(method: str, url: str, **kwargs: t.Any) -> SXNG_Response:
         network = get_context_network()
         timeout = _get_timeout(start_time, kwargs)
         future = asyncio.run_coroutine_threadsafe(
-            network.request(method, url, **kwargs),
+            network.request(method, url, **_with_isolation(kwargs)),
             get_loop(),
         )
         try:
@@ -116,7 +140,8 @@ def multi_requests(request_list: list["Request"]) -> list[SXNG_Response | Except
         for request_desc in request_list:
             timeout = _get_timeout(start_time, request_desc.kwargs)
             future = asyncio.run_coroutine_threadsafe(
-                network.request(request_desc.method, request_desc.url, **request_desc.kwargs), loop
+                network.request(request_desc.method, request_desc.url, **_with_isolation(dict(request_desc.kwargs))),
+                loop,
             )
             future_list.append((future, timeout))
 
@@ -228,7 +253,9 @@ async def stream_chunk_to_queue(network, queue, method: str, url: str, **kwargs:
 def _stream_generator(method: str, url: str, **kwargs: t.Any):
     queue = SimpleQueue()
     network = get_context_network()
-    future = asyncio.run_coroutine_threadsafe(stream_chunk_to_queue(network, queue, method, url, **kwargs), get_loop())
+    future = asyncio.run_coroutine_threadsafe(
+        stream_chunk_to_queue(network, queue, method, url, **_with_isolation(kwargs)), get_loop()
+    )
 
     # yield chunks
     obj_or_exception = queue.get()

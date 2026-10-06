@@ -59,6 +59,7 @@ class ViewsTestCase(SearxTestCase):  # pylint: disable=too-many-public-methods
                 results=test_results,
                 results_length=lambda: len(test_results),
                 get_timings=lambda: timings,
+                get_coverage=lambda: {'engines': {}, 'routes_used': [], 'answered': 0, 'queried': 0},
                 redirect_url=None,
                 engine_data={},
             )

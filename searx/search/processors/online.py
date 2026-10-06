@@ -8,7 +8,7 @@ import typing as t
 from timeit import default_timer
 import asyncio
 import ssl
-from curl_cffi.requests.exceptions import RequestException, Timeout
+from curl_cffi.requests.exceptions import RequestException, Timeout, ConnectionError as CurlConnectionError, ProxyError
 
 import searx.network
 from searx.exceptions import (
@@ -252,17 +252,23 @@ class OnlineProcessor(EngineProcessor):
     ):
         self.init_network_in_thread(start_time, timeout_limit)
 
+        # shaded: on a proxied route with per-query isolation, a transport error
+        # belongs to one circuit / tunnel, not to the engine; the next search
+        # gets another one, so do not suspend the engine for it.
+        network = searx.network.get_network(self.engine.name)
+        suspend_on_transport = not (network is not None and network.route in ('tor', 'shadenet') and network.isolate)
+
         try:
             # send requests and parse the results
             search_results = self._search_basic(query, params)
             self.extend_container(result_container, start_time, search_results)
         except ssl.SSLError as e:
             # requests timeout (connect or read)
-            self.handle_exception(result_container, e, suspend=True)
+            self.handle_exception(result_container, e, suspend=suspend_on_transport)
             self.logger.debug("SSLError {}, verify={}".format(e, searx.network.get_network(self.engine.name).verify))
         except (Timeout, asyncio.TimeoutError) as e:
             # requests timeout (connect or read)
-            self.handle_exception(result_container, e, suspend=True)
+            self.handle_exception(result_container, e, suspend=suspend_on_transport)
             self.logger.debug(
                 "HTTP requests timeout (search duration : {0} s, timeout: {1} s) : {2}".format(
                     default_timer() - start_time, timeout_limit, e.__class__.__name__
@@ -270,7 +276,8 @@ class OnlineProcessor(EngineProcessor):
             )
         except RequestException as e:
             # other requests exception
-            self.handle_exception(result_container, e, suspend=True)
+            transport = isinstance(e, (CurlConnectionError, ProxyError))
+            self.handle_exception(result_container, e, suspend=suspend_on_transport or not transport)
             self.logger.debug(
                 "requests exception (search duration : {0} s, timeout: {1} s) : {2}".format(
                     default_timer() - start_time, timeout_limit, e

@@ -80,29 +80,69 @@ class RequestParams(t.TypedDict):
 
 
 class SuspendedStatus:
-    """Class to handle suspend state."""
+    """Class to handle suspend state.
+
+    shaded: with ``search.suspend_backoff.enabled`` the suspension grows
+    exponentially with the number of continuous errors (``base * factor**(n-1)``,
+    capped at ``max``) and never exceeds that cap, whatever the error class asks
+    for.  When it expires the engine is *half-open*: exactly one search probes it
+    (:py:obj:`SuspendedStatus.should_skip`), the others keep skipping it until the
+    probe resumes or re-suspends the engine, or ``probe_timeout`` passes.
+    """
 
     def __init__(self):
         self.lock: threading.Lock = threading.Lock()
         self.continuous_errors: int = 0
         self.suspend_end_time: float = 0
         self.suspend_reason: str = ""
+        self.probe_start_time: float = 0
 
     @property
     def is_suspended(self):
         return self.suspend_end_time >= default_timer()
 
+    @staticmethod
+    def backoff_settings() -> dict[str, t.Any] | None:
+        backoff = get_setting("search.suspend_backoff", None)
+        if not backoff or not backoff.get("enabled"):
+            return None
+        return backoff
+
+    def backoff_time(self, backoff: dict[str, t.Any]) -> float:
+        exponent = max(self.continuous_errors - 1, 0)
+        return min(backoff["base"] * backoff["factor"] ** exponent, backoff["max"])
+
+    def should_skip(self) -> bool:
+        """shaded: True when the engine must not be queried by this search."""
+        now = default_timer()
+        with self.lock:
+            if self.suspend_end_time >= now:
+                return True
+            backoff = self.backoff_settings()
+            if backoff is None or self.continuous_errors == 0:
+                return False
+            # half-open: one probe at a time
+            if self.probe_start_time and now - self.probe_start_time < backoff["probe_timeout"]:
+                return True
+            self.probe_start_time = now
+            return False
+
     def suspend(self, suspended_time: int | None, suspend_reason: str):
         with self.lock:
             # update continuous_errors / suspend_end_time
             self.continuous_errors += 1
-            if suspended_time is None:
+            backoff = self.backoff_settings()
+            if backoff is not None:
+                capped = self.backoff_time(backoff)
+                suspended_time = capped if suspended_time is None else min(suspended_time, capped)
+            elif suspended_time is None:
                 max_ban: int = get_setting("search.max_ban_time_on_fail")
                 ban_fail: int = get_setting("search.ban_time_on_fail")
                 suspended_time = min(max_ban, ban_fail)
 
             self.suspend_end_time = default_timer() + suspended_time
             self.suspend_reason = suspend_reason
+            self.probe_start_time = 0
             logger.debug("Suspend for %i seconds", suspended_time)
 
     def resume(self):
@@ -111,6 +151,7 @@ class SuspendedStatus:
             self.continuous_errors = 0
             self.suspend_end_time = 0
             self.suspend_reason = ""
+            self.probe_start_time = 0
 
 
 class EngineProcessor(ABC):
@@ -121,8 +162,14 @@ class EngineProcessor(ABC):
     def __init__(self, engine: "Engine|types.ModuleType"):
         self.engine: "Engine" = engine  # pyright: ignore[reportAttributeAccessIssue]
         self.logger: logging.Logger = engines[engine.name].logger
-        key = get_network(self.engine.name)
-        key = id(key) if key else self.engine.name
+        network = get_network(self.engine.name)
+        # shaded: engines that share a proxy route (one ShadeNet proxy for google,
+        # brave, duckduckgo) are different backends; one engine's CAPTCHA must not
+        # suspend the others
+        if network is None or network.route == 'shadenet':
+            key = self.engine.name
+        else:
+            key = id(network)
         self.suspended_status: SuspendedStatus = SUSPENDED_STATUS.setdefault(key, SuspendedStatus())
 
     def initialize(self, callback: t.Callable[["EngineProcessor", bool], bool]):
@@ -191,6 +238,9 @@ class EngineProcessor(ABC):
         else:
             error_message = exception_or_message
         result_container.add_unresponsive_engine(self.engine.name, error_message)
+        result_container.note_engine(
+            self.engine.name, 'timeout' if error_message == 'timeout' else 'error', error=error_message
+        )
         # metrics
         counter_inc('engine', self.engine.name, 'search', 'count', 'error')
         if isinstance(exception_or_message, BaseException):
@@ -213,6 +263,12 @@ class EngineProcessor(ABC):
         # update result_container
         result_container.extend(self.engine.name, search_results)
         engine_time = default_timer() - start_time
+        result_container.note_engine(
+            self.engine.name,
+            'ok' if search_results else 'empty',
+            results=len(search_results),
+            seconds=round(engine_time, 3),
+        )
         page_load_time = get_time_for_thread()
         result_container.add_timing(self.engine.name, engine_time, page_load_time)
         # metrics
@@ -237,9 +293,12 @@ class EngineProcessor(ABC):
             self.suspended_status.resume()
 
     def extend_container_if_suspended(self, result_container: "ResultContainer") -> bool:
-        if self.suspended_status.is_suspended:
+        if self.suspended_status.should_skip():
             result_container.add_unresponsive_engine(
                 self.engine.name, self.suspended_status.suspend_reason, suspended=True
+            )
+            result_container.note_engine(
+                self.engine.name, 'suspended', error=self.suspended_status.suspend_reason or 'probe in flight'
             )
             return True
         return False

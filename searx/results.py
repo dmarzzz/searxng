@@ -74,6 +74,8 @@ class ResultContainer:
         self.paging: bool = False
         self.unresponsive_engines: set[UnresponsiveEngine] = set()
         self.timings: list[Timing] = []
+        self.coverage: dict[str, dict[str, t.Any]] = {}
+        """shaded: per engine route, status, result count and time (see note_engine)."""
         self.redirect_url: str | None = None
         self.on_result: t.Callable[[Result | LegacyResult], bool] = lambda _: True
         self._lock: RLock = RLock()
@@ -255,6 +257,40 @@ class ResultContainer:
                 return
             if searx.engines.engines[engine_name].display_error_messages:
                 self.unresponsive_engines.add(UnresponsiveEngine(engine_name, error_type, suspended))
+
+    def note_engine(self, engine_name: str, status: str, **fields: t.Any):
+        """shaded: record what happened to one engine in this search.
+
+        ``status`` is one of ``sent``, ``ok``, ``empty``, ``error``, ``timeout``,
+        ``suspended``, ``unsupported``, ``capped`` (over the ShadeNet
+        engines-per-query cap) or ``budget`` (the ShadeNet proxy could not open the
+        tunnels in time).  Unlike :py:obj:`add_unresponsive_engine` this ignores
+        ``display_error_messages``: the caller always learns what was skipped.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            entry = self.coverage.setdefault(engine_name, {})
+            entry.update(fields)
+            entry['status'] = status
+
+    def get_coverage(self) -> dict[str, t.Any]:
+        """shaded: the ``coverage`` block of the JSON response."""
+        with self._lock:
+            engines = {name: dict(entry) for name, entry in sorted(self.coverage.items())}
+        for entry in engines.values():
+            if entry['status'] == 'sent':
+                # still running when the search returned
+                entry['status'] = 'timeout'
+        routes_used = sorted(
+            {e['route'] for e in engines.values() if e.get('route') and e['status'] in ('ok', 'empty')}
+        )
+        return {
+            'engines': engines,
+            'routes_used': routes_used,
+            'answered': sum(1 for e in engines.values() if e['status'] == 'ok'),
+            'queried': sum(1 for e in engines.values() if e['status'] not in ('suspended', 'capped', 'budget')),
+        }
 
     def add_timing(self, engine_name: str, engine_time: float, page_load_time: float):
         with self._lock:
