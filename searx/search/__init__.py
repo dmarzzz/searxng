@@ -34,6 +34,7 @@ from searx.search import shadenet
 
 if t.TYPE_CHECKING:
     from .models import SearchQuery
+    from searx.search.processors.abstract import EngineProcessor
     from searx.extended_types import SXNG_Request
 
 logger = logger.getChild('search')
@@ -113,8 +114,7 @@ class Search:
             route = network.route if network else None
             self.result_container.note_engine(engineref.name, 'sent', route=route)
 
-            if route == 'shadenet' and engineref.name not in shadenet_allowed:
-                self.result_container.note_engine(engineref.name, 'capped')
+            if route == 'shadenet' and self._shadenet_skip(engineref.name, processor, shadenet_allowed):
                 continue
 
             # stop the request now if the engine is suspend
@@ -171,6 +171,16 @@ class Search:
                 requests = [r for r in requests if not shadenet.is_shadenet(r[0])]
 
         return requests, actual_timeout
+
+    def _shadenet_skip(self, engine_name: str, processor: "EngineProcessor", allowed: set[str]) -> bool:
+        """shaded: True when a ShadeNet engine sits this search out (cap or pacing)."""
+        if engine_name not in allowed:
+            self.result_container.note_engine(engine_name, 'capped')
+            return True
+        if not processor.suspended_status.is_suspended and shadenet.paced(engine_name):
+            self.result_container.note_engine(engine_name, 'paced')
+            return True
+        return False
 
     def search_multiple_requests(self, requests: list[tuple[str, str, RequestParams]]):
         # pylint: disable=protected-access

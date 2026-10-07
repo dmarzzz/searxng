@@ -11,6 +11,7 @@ from collections.abc import Generator
 import atexit
 import asyncio
 import hashlib
+import time
 import ipaddress
 from itertools import cycle
 from urllib.parse import urlsplit, urlunsplit
@@ -76,7 +77,7 @@ def _isolated_proxy_url(proxy_url: str, isolation: str) -> str:
 
 
 @t.final
-class Network:
+class Network:  # pylint: disable=too-many-instance-attributes, too-many-public-methods
 
     __slots__ = (
         'enable_http',
@@ -92,6 +93,11 @@ class Network:
         'retry_on_http_error',
         'route',
         'isolate',
+        'warm',
+        'warm_stats',
+        '_warm_pool',
+        '_warm_in_flight',
+        '_warm_used',
         '_local_addresses_cycle',
         '_proxies_cycle',
         '_clients',
@@ -120,6 +126,7 @@ class Network:
         route: str | None = None,
         require_route: bool = False,
         isolate: bool | str = False,
+        warm: dict[str, t.Any] | None = None,
     ):
 
         self.enable_http = enable_http
@@ -142,6 +149,11 @@ class Network:
         if isolate not in (False, True, 'query', 'engine'):
             raise ValueError("isolate has to be false, true / 'query' or 'engine'")
         self.isolate = 'query' if isolate is True else isolate
+        self.warm = warm or None
+        self.warm_stats = {'built': 0, 'failed': 0, 'used': 0, 'expired': 0, 'skipped_budget': 0}
+        self._warm_pool: list[tuple[float, tuple[t.Any, ...], AsyncClient]] = []
+        self._warm_in_flight = 0
+        self._warm_used: set[str] = set()
         self.check_parameters()
 
     def resolve_route(self, route: str | None, require_route: bool) -> str | None:
@@ -274,6 +286,13 @@ class Network:
             proxies = tuple((pattern, _isolated_proxy_url(url, circuit)) for pattern, url in proxies)
         curl_key = tuple(sorted((int(k), v) for k, v in (curl_options or {}).items()))
         key = (verify, max_redirects, local_address, proxies, impersonate, curl_key, enable_http3, isolation)
+        if isolation is not None and self.warm and key not in self._clients:
+            warm_client = self._take_warm(key[:-1])
+            if warm_client is not None:
+                self._clients[key] = warm_client
+                self._iso_keys.setdefault(isolation, []).append(key)
+                self._warm_used.add(isolation)
+                return warm_client
         if key not in self._clients or self._clients[key].is_closed:
             client = new_client(
                 self.enable_http,
@@ -294,6 +313,90 @@ class Network:
             if isolation is not None:
                 self._iso_keys.setdefault(isolation, []).append(key)
         return self._clients[key]
+
+    # -- shaded: warm tunnels --------------------------------------------------
+    #
+    # ``warm: {size, url, max_age, reserve, impersonate}`` keeps ``size`` clients
+    # whose connection through the proxy is already open: each was used for one
+    # GET of ``url`` (a page without any query) and is then handed to exactly
+    # one search, so connection reuse across searches stays off.  On a ShadeNet
+    # route a client is only warmed while the proxy's plan shows more than
+    # ``reserve`` tunnels left this epoch.
+
+    def _take_warm(self, key_base: tuple[t.Any, ...]) -> AsyncClient | None:
+        max_age = float(self.warm.get('max_age', 40)) if self.warm else 0
+        now = time.monotonic()
+        for i, (built_at, warm_key, client) in enumerate(self._warm_pool):
+            if warm_key == key_base and now - built_at < max_age and not client.is_closed:
+                del self._warm_pool[i]
+                self.warm_stats['used'] += 1
+                return client
+        return None
+
+    def warm_used(self, isolation: str) -> bool:
+        """True once, when the search with this isolation id ran on a warm client."""
+        if isolation in self._warm_used:
+            self._warm_used.discard(isolation)
+            return True
+        return False
+
+    async def _warm_one(self, url: str, impersonate: str):
+        self._warm_in_flight += 1
+        client = None
+        try:
+            local_address = next(self._local_addresses_cycle)
+            proxies = next(self._proxies_cycle)
+            key_base = (self.verify, self.max_redirects, local_address, proxies, impersonate, (), self.enable_http3)
+            client = new_client(
+                self.enable_http,
+                self.verify,
+                self.enable_http2,
+                self.enable_http3,
+                self.max_connections,
+                dict(proxies),
+                local_address,
+                self.max_redirects,
+                impersonate=impersonate,
+            )
+            response = await client.get(url, timeout=30)
+            if 200 <= response.status_code < 400:
+                self._warm_pool.append((time.monotonic(), key_base, client))
+                self.warm_stats['built'] += 1
+                client = None
+            else:
+                self.warm_stats['failed'] += 1
+        except RequestException:
+            self.warm_stats['failed'] += 1
+        finally:
+            self._warm_in_flight -= 1
+            if client is not None:
+                await client.aclose()
+
+    async def warm_loop(self):
+        """Keep the warm pool full (runs on the network loop)."""
+        from searx.search import shadenet  # pylint: disable=import-outside-toplevel, cyclic-import
+
+        size = int(self.warm.get('size', 2))
+        url = self.warm['url']
+        max_age = float(self.warm.get('max_age', 40))
+        reserve = int(self.warm.get('reserve', 4))
+        impersonate = self.warm.get('impersonate') or DEFAULT_IMPERSONATE
+        loop = asyncio.get_running_loop()
+        while True:
+            now = time.monotonic()
+            for item in [i for i in self._warm_pool if now - i[0] >= max_age]:
+                self._warm_pool.remove(item)
+                self.warm_stats['expired'] += 1
+                await item[2].aclose()
+            missing = size - len(self._warm_pool) - self._warm_in_flight
+            if missing > 0:
+                plan = await loop.run_in_executor(None, shadenet.plan, 1) if self.route == 'shadenet' else None
+                if plan is not None and int(plan.get('availableNow', 0)) <= reserve:
+                    self.warm_stats['skipped_budget'] += 1
+                else:
+                    for _ in range(missing):
+                        asyncio.ensure_future(self._warm_one(url, impersonate))
+            await asyncio.sleep(1)
 
     async def release(self, isolation: str):
         """shaded: close the clients of one isolation id (connection reuse OFF)."""
@@ -396,6 +499,16 @@ def get_network(name: str | None = None) -> "Network":
     return NETWORKS.get(name or DEFAULT_NAME)  # pyright: ignore[reportReturnType]
 
 
+def _start_warm_loops():
+    """shaded: start the warm-tunnel loop of every network that asks for one."""
+    loop = get_loop()
+    if not loop:
+        return
+    for network in {id(n): n for n in NETWORKS.values()}.values():
+        if network.warm and network.route is not None:
+            asyncio.run_coroutine_threadsafe(network.warm_loop(), loop)
+
+
 def release_isolation(isolation: str):
     """shaded: close every client opened for ``isolation`` (does not wait)."""
     loop = get_loop()
@@ -451,6 +564,7 @@ def initialize(
         'retry_on_http_error': False,
         'require_route': settings_outgoing.get('require_route', False),
         'isolate': settings_outgoing.get('isolate', False),
+        'warm': None,
     }
 
     def new_network(params: dict[str, t.Any], logger_name: str | None = None):
@@ -503,6 +617,8 @@ def initialize(
     for engine_name, engine, network in iter_networks():
         if isinstance(network, str):
             NETWORKS[engine_name] = NETWORKS[network]
+
+    _start_warm_loops()
 
     # the /image_proxy endpoint has a dedicated network.
     # same parameters than the default network, but HTTP/2 is disabled.

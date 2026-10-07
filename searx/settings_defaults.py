@@ -294,6 +294,7 @@ SCHEMA: dict[str, t.Any] = {
             'url': SettingsValue((None, str), None),
             'token_file': SettingsValue((None, str), None),
             'max_engines_per_query': SettingsValue(int, 1),
+            'min_interval': SettingsValue(numbers.Real, 0),
         },
         'networks': {},
     },

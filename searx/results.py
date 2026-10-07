@@ -265,7 +265,7 @@ class ResultContainer:
 
         ``status`` is one of ``sent``, ``ok``, ``empty``, ``error``, ``timeout``,
         ``late`` (still running at ``search.deadline``), ``suspended``,
-        ``unsupported``, ``capped`` (over the ShadeNet
+        ``unsupported``, ``paced`` (ShadeNet pacing), ``capped`` (over the ShadeNet
         engines-per-query cap) or ``budget`` (the ShadeNet proxy could not open the
         tunnels in time).  Unlike :py:obj:`add_unresponsive_engine` this ignores
         ``display_error_messages``: the caller always learns what was skipped.
@@ -276,6 +276,13 @@ class ResultContainer:
             entry = self.coverage.setdefault(engine_name, {})
             entry.update(fields)
             entry['status'] = status
+
+    def annotate_engine(self, engine_name: str, **fields: t.Any):
+        """shaded: add fields to an engine's coverage entry without changing its status."""
+        with self._lock:
+            if self._closed or engine_name not in self.coverage:
+                return
+            self.coverage[engine_name].update(fields)
 
     def get_coverage(self) -> dict[str, t.Any]:
         """shaded: the ``coverage`` block of the JSON response."""

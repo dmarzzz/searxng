@@ -536,3 +536,80 @@ class TestDuckDuckGoBrowserGet(SearxTestCase):
         self.assertEqual(params['url'], 'https://html.duckduckgo.com/html/?q=tor+exit+blocking')
         self.assertEqual(params['headers'], {})  # every header comes from the browser profile
         self.assertEqual(params['data']['q'], 'tor exit blocking')
+
+
+class TestWarmTunnels(SearxTestCase):
+
+    def _network(self, **warm):
+        return Network(proxies=SHADENET, route='shadenet', isolate=True, warm={'size': 1, 'url': 'https://x/', **warm})
+
+    async def test_warm_client_is_handed_to_one_search(self):
+        network = self._network()
+        response = type('R', (), {'status_code': 200})()
+        with patch('searx.network.client.AsyncClient.get', return_value=response):
+            await network._warm_one('https://x/', 'chrome')
+        self.assertEqual(network.warm_stats['built'], 1)
+        warmed = network._warm_pool[0][2]
+        first = await network.get_client(isolation='s1:duckduckgo', impersonate='chrome')
+        second = await network.get_client(isolation='s2:duckduckgo', impersonate='chrome')
+        self.assertIs(first, warmed)
+        self.assertIsNot(second, warmed)  # used once, never shared across searches
+        self.assertTrue(network.warm_used('s1:duckduckgo'))
+        self.assertFalse(network.warm_used('s1:duckduckgo'))
+        self.assertFalse(network.warm_used('s2:duckduckgo'))
+        await network.aclose()
+
+    async def test_profile_mismatch_is_not_used(self):
+        network = self._network()
+        response = type('R', (), {'status_code': 200})()
+        with patch('searx.network.client.AsyncClient.get', return_value=response):
+            await network._warm_one('https://x/', 'chrome')
+        client = await network.get_client(isolation='s1:duckduckgo', impersonate='firefox')
+        self.assertIsNot(client, network._warm_pool[0][2])
+        await network.aclose()
+
+    async def test_stale_or_failed_warmups_are_not_used(self):
+        network = self._network(max_age=0)
+        bad = type('R', (), {'status_code': 403})()
+        with patch('searx.network.client.AsyncClient.get', return_value=bad):
+            await network._warm_one('https://x/', 'chrome')
+        self.assertEqual(network.warm_stats['failed'], 1)
+        self.assertEqual(network._warm_pool, [])
+        ok = type('R', (), {'status_code': 200})()
+        with patch('searx.network.client.AsyncClient.get', return_value=ok):
+            await network._warm_one('https://x/', 'chrome')
+        self.assertIsNone(network._take_warm(network._warm_pool[0][1]))  # max_age 0: stale
+        await network.aclose()
+
+
+class TestPacing(SearxTestCase):
+
+    def test_min_interval_per_engine(self):
+        previous = copy.deepcopy(searx.settings['outgoing'])
+        self.addCleanup(lambda: searx.settings.__setitem__('outgoing', previous))
+        searx.settings['outgoing']['shadenet']['min_interval'] = 5
+        shadenet._last_sent.clear()
+        clock = [100.0]
+        with patch('searx.search.shadenet.default_timer', lambda: clock[0]):
+            self.assertFalse(shadenet.paced('duckduckgo'))
+            clock[0] = 102
+            self.assertTrue(shadenet.paced('duckduckgo'))
+            self.assertFalse(shadenet.paced('brave'))  # its own clock
+            clock[0] = 105.5
+            self.assertFalse(shadenet.paced('duckduckgo'))
+
+    def test_off_by_default(self):
+        shadenet._last_sent.clear()
+        self.assertFalse(shadenet.paced('duckduckgo'))
+        self.assertFalse(shadenet.paced('duckduckgo'))
+
+
+class TestAnnotate(SearxTestCase):
+
+    def test_annotate_keeps_status(self):
+        rc = ResultContainer()
+        rc.note_engine('duckduckgo', 'ok', results=10)
+        rc.annotate_engine('duckduckgo', warm=True)
+        rc.annotate_engine('nobody', warm=True)
+        self.assertEqual(rc.coverage['duckduckgo'], {'status': 'ok', 'results': 10, 'warm': True})
+        self.assertNotIn('nobody', rc.coverage)

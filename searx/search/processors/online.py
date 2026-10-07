@@ -350,3 +350,6 @@ class OnlineProcessor(EngineProcessor):
         finally:
             for fresh in fresh_isolations:
                 release_isolation(fresh)
+            isolation = THREADLOCAL.__dict__.get("isolation")
+            if network is not None and network.warm and isolation and network.warm_used(isolation):
+                result_container.annotate_engine(self.engine.name, warm=True)

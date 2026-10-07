@@ -58,6 +58,28 @@ def allowed_engines(candidates: list[tuple[str, "EngineProcessor"]]) -> set[str]
     return {name for _, _, name in healthy[: max_engines_per_query()]}
 
 
+_pace_lock = threading.Lock()
+_last_sent: dict[str, float] = {}
+
+
+def paced(engine_name: str) -> bool:
+    """True when ``engine_name`` was sent less than ``outgoing.shadenet.min_interval``
+    seconds ago; otherwise record this send and return False.
+
+    The proxy does not say which canopy node a tunnel used, and a session book
+    sends all its tickets to one node, so this paces per engine; with the proxy's
+    rotation across nodes that bounds each node's rate too."""
+    min_interval = float(get_setting("outgoing.shadenet.min_interval", 0) or 0)
+    if min_interval <= 0:
+        return False
+    now = default_timer()
+    with _pace_lock:
+        if now - _last_sent.get(engine_name, float("-inf")) < min_interval:
+            return True
+        _last_sent[engine_name] = now
+        return False
+
+
 def _token() -> str | None:
     token_file = get_setting("outgoing.shadenet.token_file", None)
     if not token_file:
